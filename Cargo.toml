@@ -1,0 +1,14 @@
+[package]
+name = "ekto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mr_bundle = "0.3.4"
+holochain_types = "0.3.4"
+holochain_client = { version = "0.5.3", default-features = false }
+warp = "0.3"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1"
+tokio = "1"
+zip = "2"

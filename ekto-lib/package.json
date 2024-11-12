@@ -1,0 +1,31 @@
+{
+  "name": "ekto-lib",
+  "version": "0.1.0",
+  "description": "Ekto integration library for webapps",
+  "private": true,
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "vite build",
+    "format": "prettier --write \"*.js\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ThetaSinner/ekto.git"
+  },
+  "author": "ThetaSinner",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/ThetaSinner/ekto/issues"
+  },
+  "homepage": "https://github.com/ThetaSinner/ekto#readme",
+  "dependencies": {
+    "libsodium-wrappers-sumo": "^0.7.15"
+  },
+  "type": "module",
+  "devDependencies": {
+    "@types/libsodium-wrappers-sumo": "^0.7.8",
+    "prettier": "3.3.3",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}

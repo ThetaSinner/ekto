@@ -1,2 +1,4 @@
 /target
 *.webhapp
+ekto-lib/dist
+out/*

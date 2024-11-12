@@ -1,19 +1,27 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use holochain_client::IssueAppAuthenticationTokenPayload;
+use holochain_client::{
+    AuthorizeSigningCredentialsPayload, IssueAppAuthenticationTokenPayload, SigningCredentials,
+};
 use holochain_types::app::{AppBundleSource, InstallAppPayload, InstalledAppId};
-use holochain_types::prelude::AppBundle;
+use holochain_types::prelude::{AppBundle, CellId, GrantedFunctions};
 use holochain_types::websocket::AllowedOrigins;
 use mr_bundle::{Bundle, Location};
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use rand::RngCore;
+use sha3::Digest;
 use tokio::sync::Mutex;
 use warp::http::{HeaderValue, Response, StatusCode};
 use warp::Filter;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 mod inject;
+
+const EKTO_LIB: &str = include_str!("../ekto-lib/dist/ekto-lib.js");
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -32,9 +40,31 @@ enum Commands {
     },
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisterRequest {
+    public_key: Vec<u8>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "tracing=info,warp=debug".to_owned());
+    tracing_subscriber::fmt()
+        // Use the filter we built above to determine which traces to record.
+        .with_env_filter(filter)
+        // Record an event when each span closes. This can be used to time our
+        // routes' durations!
+        .with_span_events(FmtSpan::CLOSE)
+        .init();
+
     let cli = Cli::parse();
+
+    let mut hasher = sha3::Sha3_256::new();
+    hasher.update(EKTO_LIB.as_bytes());
+    let hash = hasher.finalize();
+    let ekto_lib_hash = format!("{hash:x}");
+
+    println!("Hash: {}", ekto_lib_hash);
 
     match &cli.command {
         Commands::Run { webapp } => {
@@ -82,8 +112,9 @@ async fn main() -> anyhow::Result<()> {
                                     )?;
                                 }
 
-                                inject::inject_ekto_shim(out)
-                                    .context("Failed to inject ekto shim")?;
+                                inject::inject_ekto(out, EKTO_LIB, ekto_lib_hash.clone()).context("Failed to inject ekto")?;
+                            } else {
+                                inject::require_ekto_lib_latest(out, EKTO_LIB, ekto_lib_hash.clone()).context("Failed to update ekto lib")?;
                             }
                         }
                         location => {
@@ -135,6 +166,11 @@ async fn main() -> anyhow::Result<()> {
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to install app: {e:?}"))?;
+
+                client
+                    .enable_app(name.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to enable app: {e:?}"))?;
             }
 
             let app_port = find_or_create_holochain_app_interface(&client).await?;
@@ -142,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
             let client = Arc::new(Mutex::new(client));
             let installed_app_id = name.to_string();
             let shim = warp::path!("ekto-shim.js")
-                .and(with_shim_args(client, installed_app_id))
+                .and(with_shim_args(client, ekto_lib_hash, installed_app_id))
                 .and(warp::header::optional("Origin"))
                 .and_then(
                     move |shim_args: ShimArgs, origin: Option<HeaderValue>| async move {
@@ -169,6 +205,11 @@ async fn main() -> anyhow::Result<()> {
                         };
                         let token = token_issued.token;
 
+                        let mut rng = rand::thread_rng();
+                        let mut salt_bytes = [0u8; 16];
+                        rng.fill_bytes(&mut salt_bytes);
+
+                        let ekto_lib_hash = shim_args.ekto_lib_hash.clone();
                         let installed_app_id = shim_args.installed_app_id.clone();
                         Result::<_, warp::Rejection>::Ok(
                             Response::builder()
@@ -176,20 +217,54 @@ async fn main() -> anyhow::Result<()> {
                                 .header("content-type", "application/javascript")
                                 .body(format!(
                                     r#"
+                                    import {{generateKey}} from './ekto-lib-{ekto_lib_hash}.js';
+
                   window.__HC_LAUNCHER_ENV__ = {{
                     APP_INTERFACE_PORT: {app_port},
                     INSTALLED_APP_ID: "{installed_app_id}",
                     APP_INTERFACE_TOKEN: {token:?},
                   }};
+
+                  const salt = {salt_bytes:?};
+
+                  const form = document.createElement("form");
+                  document.body.insertBefore(form, document.body.firstChild);
+
+                  const input = document.createElement("input");
+                  input.setAttribute("type", "password");
+                  input.setAttribute("id", "ekto-password");
+                  form.appendChild(input);
+
+                  const button = document.createElement("button");
+                  button.innerText = "Submit";
+                  // TODO onclick
+                  form.appendChild(button);
+
+                  const keyPair = generateKey("testing", Uint8Array.from(salt));
+                  console.log("Generated key pair:", keyPair);
+
+
                 "#
                                 )),
                         )
                     },
                 );
 
+            let register = warp::post()
+                .and(warp::path::path("ekto-register"))
+                .and(warp::path::end())
+                .and(warp::body::content_length_limit(200))
+                .and(warp::body::json())
+                .map(|register_request: RegisterRequest| {
+                    println!("Registering: {:?}", register_request);
+                    Response::builder().status(StatusCode::OK).body("")
+                });
+
             let out = warp::get().and(warp::fs::dir("./out/"));
             println!();
-            warp::serve(shim.or(out)).run(([127, 0, 0, 1], 8484)).await;
+            warp::serve(shim.or(register).or(out))
+                .run(([127, 0, 0, 1], 8484))
+                .await;
         }
     }
 
@@ -199,15 +274,18 @@ async fn main() -> anyhow::Result<()> {
 #[derive(Clone)]
 struct ShimArgs {
     client: Arc<Mutex<holochain_client::AdminWebsocket>>,
+    ekto_lib_hash: String,
     installed_app_id: InstalledAppId,
 }
 
 fn with_shim_args(
     client: Arc<Mutex<holochain_client::AdminWebsocket>>,
+    ekto_lib_hash: String,
     installed_app_id: InstalledAppId,
 ) -> impl Filter<Extract = (ShimArgs,), Error = std::convert::Infallible> + Clone {
     warp::any().map(move || ShimArgs {
         client: client.clone(),
+        ekto_lib_hash: ekto_lib_hash.clone(),
         installed_app_id: installed_app_id.clone(),
     })
 }

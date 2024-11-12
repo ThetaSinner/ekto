@@ -5,9 +5,12 @@ use html5ever::tendril::TendrilSink;
 use html5ever::{local_name, ns, parse_document, serialize, Attribute, QualName};
 use markup5ever_rcdom::{Handle, Node, NodeData, RcDom, SerializableHandle};
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use sha3::Digest;
+use sha3::digest::Update;
 
-pub fn inject_ekto_shim(content_root: PathBuf) -> anyhow::Result<()> {
+pub fn inject_ekto(content_root: PathBuf, ekto_lib: &str, ekto_lib_hash: String) -> anyhow::Result<()> {
     let index = content_root.join("index.html");
     if !index.exists() {
         anyhow::bail!("No index.html found in content root");
@@ -20,6 +23,8 @@ pub fn inject_ekto_shim(content_root: PathBuf) -> anyhow::Result<()> {
 
     inject_ekto_shim_script(&doc)?;
 
+    require_ekto_lib_latest(content_root, ekto_lib, ekto_lib_hash)?;
+
     let document: SerializableHandle = doc.document.clone().into();
     let mut file = std::fs::File::create(&index)?;
     serialize(&mut file, &document, Default::default()).context("serialization failed")?;
@@ -27,12 +32,27 @@ pub fn inject_ekto_shim(content_root: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn require_ekto_lib_latest(content_root: PathBuf, ekto_lib: &str, ekto_lib_hash: String) -> anyhow::Result<String> {
+    let ekto_lib_name = format!("ekto-lib-{ekto_lib_hash}.js");
+    let buf = content_root.join(ekto_lib_name.clone());
+    if !buf.exists() {
+        // TODO could remove older bundles here
+        let mut lib_file = std::fs::File::create_new(buf)?;
+        lib_file.write_all(ekto_lib.as_bytes())?;
+    }
+
+    Ok(ekto_lib_name)
+}
+
 fn inject_ekto_shim_script(doc: &RcDom) -> anyhow::Result<()> {
     if let Some(html) = first_child(&doc.document, "html") {
         if let Some(head) = first_child(&html, "head") {
-            let node = AppendNode(Node::new(NodeData::Element {
+            let shim_node = AppendNode(Node::new(NodeData::Element {
                 name: QualName::new(None, ns!(html), local_name!("script")),
                 attrs: RefCell::new(vec![Attribute {
+                    name: QualName::new(None, ns!(), local_name!("type")),
+                    value: "module".into(),
+                }, Attribute {
                     name: QualName::new(None, ns!(), local_name!("src")),
                     value: "/ekto-shim.js".into(),
                 }]),
@@ -42,10 +62,10 @@ fn inject_ekto_shim_script(doc: &RcDom) -> anyhow::Result<()> {
 
             if let Some(script) = first_child(&head, "script") {
                 // If there is another script tag in the head, insert before it so the shim is loaded first
-                doc.append_before_sibling(&script, node);
+                doc.append_before_sibling(&script, shim_node);
             } else {
                 // Otherwise, just append to the end of the head
-                doc.append(&head, node);
+                doc.append(&head, shim_node);
             }
         }
     }

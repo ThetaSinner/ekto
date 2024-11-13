@@ -19,6 +19,8 @@
   },
   "homepage": "https://github.com/ThetaSinner/ekto#readme",
   "dependencies": {
+    "@holochain/client": "^0.17.1",
+    "@msgpack/msgpack": "^2.8.0",
     "libsodium-wrappers-sumo": "^0.7.15"
   },
   "type": "module",

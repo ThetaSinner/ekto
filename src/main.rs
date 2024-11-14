@@ -1,20 +1,17 @@
+use crate::approve_key::approve_key;
+use crate::holochain_external::{
+    find_or_create_holochain_app_interface, try_connect_holochain_admin_client,
+};
+use crate::ui::{run_ui, KeyForApproval, UiEvent};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use holochain_client::{AgentPubKey, IssueAppAuthenticationTokenPayload};
-use holochain_conductor_api::CellInfo;
+use holochain_client::IssueAppAuthenticationTokenPayload;
 use holochain_types::app::{AppBundleSource, InstallAppPayload, InstalledAppId};
-use holochain_types::prelude::{
-    AppBundle, CapAccess, GrantZomeCallCapabilityPayload, GrantedFunctions, ZomeCallCapGrant,
-    CAP_SECRET_BYTES,
-};
-use holochain_types::websocket::AllowedOrigins;
-use html5ever::tendril::fmt::Slice;
+use holochain_types::prelude::AppBundle;
 use mr_bundle::{Bundle, Location};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha3::Digest;
-use std::collections::{BTreeSet, HashSet};
-use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -22,7 +19,10 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use warp::http::{HeaderValue, Response, StatusCode, Uri};
 use warp::{Filter, Rejection};
 
+mod approve_key;
+mod holochain_external;
 mod inject;
+mod ui;
 
 const EKTO_LIB: &str = include_str!("../ekto-lib/dist/ekto-lib.js");
 
@@ -61,7 +61,7 @@ struct RegisterRequest {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "tracing=info,warp=debug".to_owned());
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "ekto=info,warp=debug".to_owned());
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         // Record an event when each span closes. This can be used to time our
@@ -71,12 +71,15 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    let (send_ui_event, mut ui_event) = tokio::sync::mpsc::channel(100);
+    let ui_app = ui::MyApp::new(send_ui_event);
+    let keys_for_approval = ui_app.keys_for_approval.clone();
+    let (send_require_ui, require_ui) = tokio::sync::mpsc::channel(1);
+
     let mut hasher = sha3::Sha3_256::new();
     hasher.update(EKTO_LIB.as_bytes());
     let hash = hasher.finalize();
     let ekto_lib_hash = format!("{hash:x}");
-
-    println!("Hash: {}", ekto_lib_hash);
 
     match &cli.command {
         Commands::Run { webapp } => {
@@ -276,85 +279,58 @@ injectPasswordForm(submitPassword);
                 .and(warp::path::end())
                 .and(warp::body::content_length_limit(200))
                 .and(warp::body::json())
-                .map(|register_request: RegisterRequest| {
-                    println!(
-                        "A new key requires approval: {}",
-                        hex::encode(register_request.public_key)
-                    );
-                    Response::builder().status(StatusCode::OK).body("")
+                .map({
+                    let installed_app_id = name.to_string();
+                    let keys_for_approval = keys_for_approval.clone();
+                    move |register_request: RegisterRequest| {
+                        let present_key = hex::encode(register_request.public_key);
+                        tracing::info!("A new key requires approval: {}", present_key);
+                        keys_for_approval
+                            .write()
+                            .expect("Failed to write key")
+                            .push(KeyForApproval {
+                                key: present_key,
+                                for_app_id: installed_app_id.clone(),
+                            });
+                        send_require_ui
+                            .try_send("New key requires approval".to_string())
+                            .ok();
+                        Response::builder().status(StatusCode::OK).body("")
+                    }
                 });
 
             let out = warp::get()
                 .and(warp::fs::dir("./out/"))
                 .recover(handle_fs_rejection);
-            warp::serve(shim.or(register).or(out))
-                .run(([127, 0, 0, 1], 8484))
-                .await;
+
+            let handler = shim.or(register).or(out);
+
+            tokio::spawn(async move {
+                warp::serve(handler).run(([127, 0, 0, 1], 8484)).await;
+            });
+
+            tokio::spawn(async move {
+                // Will run until all senders are closed
+                while let Some(event) = ui_event.recv().await {
+                    match event {
+                        UiEvent::KeyApproved(key_for_approval) => {
+                            if let Err(e) =
+                                approve_key(&key_for_approval.key, &key_for_approval.for_app_id)
+                                    .await
+                            {
+                                tracing::error!("Failed to approve key: {e}");
+                            } else if let Ok(mut keys) = keys_for_approval.write() {
+                                keys.retain(|k| k != &key_for_approval);
+                            }
+                        }
+                    }
+                }
+            });
+
+            run_ui(ui_app, require_ui).await;
         }
         Commands::Approve { app_id, key } => {
-            let key_bytes = hex::decode(key).context("Failed to decode key")?;
-            if key_bytes.len() != 32 {
-                anyhow::bail!("Key must be 32 bytes long");
-            }
-
-            let client = match try_connect_holochain_admin_client().await? {
-                Some(c) => c,
-                None => anyhow::bail!("Couldn't connect to Holochain admin interface"),
-            };
-
-            let app = client
-                .list_apps(None)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to list apps: {e:?}"))?
-                .into_iter()
-                .find(|app| &app.installed_app_id == app_id)
-                .ok_or_else(|| anyhow::anyhow!("App not found"))?;
-
-            for cell_info in app.cell_info.values().flatten() {
-                let cell_id = match cell_info {
-                    CellInfo::Provisioned(cell) => cell.cell_id.clone(),
-                    CellInfo::Cloned(_) => {
-                        println!("Clone cells are not supported");
-                        continue;
-                    }
-                    CellInfo::Stem(_) => {
-                        println!("Stem cells are not supported");
-                        continue;
-                    }
-                };
-
-                let mut cap_secret = [0; CAP_SECRET_BYTES];
-                cap_secret[..32].clone_from_slice(key_bytes.as_bytes());
-                cap_secret[32..].clone_from_slice(key_bytes.as_bytes());
-
-                // TODO Needs to match what the UI sends as "provenance" in zome calls but really
-                //      Holochain should be correcting missing or wrong location bytes because it's
-                //      an internal detail and the UI shouldn't have to know about it.
-                //      Equally, why is the capability not found if these location bytes don't match?
-                //      It's only the 32-bit agent public key that identifies the agent, and the location
-                //      bytes are meta-data.
-                let mut key_with_location = key_bytes.clone();
-                key_with_location.extend(&[0, 0, 0, 0]);
-
-                client
-                    .grant_zome_call_capability(GrantZomeCallCapabilityPayload {
-                        cell_id: cell_id.clone(),
-                        cap_grant: ZomeCallCapGrant {
-                            tag: "zome-call-signing-key".to_string(),
-                            access: CapAccess::Assigned {
-                                secret: cap_secret.into(),
-                                assignees: BTreeSet::from([AgentPubKey::from_raw_36(
-                                    key_with_location.clone(),
-                                )]),
-                            },
-                            functions: GrantedFunctions::All,
-                        },
-                    })
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Conductor API error: {:?}", e))?;
-
-                println!("Granted zome call capability for cell: {:?}", cell_id);
-            }
+            approve_key(key, app_id).await?;
         }
     }
 
@@ -378,60 +354,6 @@ fn with_shim_args(
         ekto_lib_hash: ekto_lib_hash.clone(),
         installed_app_id: installed_app_id.clone(),
     })
-}
-
-async fn try_connect_holochain_admin_client(
-) -> anyhow::Result<Option<holochain_client::AdminWebsocket>> {
-    let mut found_ports = HashSet::new();
-    let proc = proc_ctl::ProcQuery::new()
-        .process_name("holochain")
-        .list_processes()
-        .context("Failed to query for Holochain process")?;
-    for proc in proc {
-        let ports = proc_ctl::PortQuery::new()
-            .process_id(proc.pid)
-            .tcp_only()
-            .execute()
-            .context("Failed to query for Holochain ports")?;
-        for port in ports {
-            if let proc_ctl::ProtocolPort::Tcp(port) = port {
-                found_ports.insert(port);
-            }
-        }
-    }
-
-    for port in found_ports {
-        if let Ok(client) =
-            holochain_client::AdminWebsocket::connect((Ipv6Addr::LOCALHOST, port)).await
-        {
-            if client.list_app_interfaces().await.is_ok() {
-                return Ok(Some(client));
-            }
-        }
-    }
-
-    Ok(None)
-}
-
-async fn find_or_create_holochain_app_interface(
-    client: &holochain_client::AdminWebsocket,
-) -> anyhow::Result<u16> {
-    let app_interfaces = client
-        .list_app_interfaces()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to list app interfaces: {e:?}"))?;
-
-    for interface in app_interfaces {
-        if interface.installed_app_id.is_none() && interface.allowed_origins == AllowedOrigins::Any
-        {
-            return Ok(interface.port);
-        }
-    }
-
-    client
-        .attach_app_interface(0, AllowedOrigins::Any, None)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to attach app interface: {e:?}"))
 }
 
 async fn handle_fs_rejection(err: Rejection) -> Result<impl warp::Reply, Rejection> {

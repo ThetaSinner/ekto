@@ -1,25 +1,26 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use holochain_client::{AgentPubKey, AuthorizeSigningCredentialsPayload, IssueAppAuthenticationTokenPayload, SigningCredentials};
+use holochain_client::{AgentPubKey, IssueAppAuthenticationTokenPayload};
+use holochain_conductor_api::CellInfo;
 use holochain_types::app::{AppBundleSource, InstallAppPayload, InstalledAppId};
-use holochain_types::prelude::{AppBundle, CapAccess, CellId, GrantZomeCallCapabilityPayload, GrantedFunctions, ZomeCallCapGrant, CAP_SECRET_BYTES};
+use holochain_types::prelude::{
+    AppBundle, CapAccess, GrantZomeCallCapabilityPayload, GrantedFunctions, ZomeCallCapGrant,
+    CAP_SECRET_BYTES,
+};
 use holochain_types::websocket::AllowedOrigins;
+use html5ever::tendril::fmt::Slice;
 use mr_bundle::{Bundle, Location};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use sha3::Digest;
+use std::collections::{BTreeSet, HashSet};
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
-use std::ptr::copy;
 use std::sync::Arc;
-use holochain_conductor_api::CellInfo;
-use html5ever::tendril::fmt::Slice;
-use rand::RngCore;
-use rand::rngs::OsRng;
-use sha3::Digest;
 use tokio::sync::Mutex;
-use warp::http::{HeaderValue, Response, StatusCode, Uri};
-use warp::{Filter, Rejection, Reply};
 use tracing_subscriber::fmt::format::FmtSpan;
+use warp::http::{HeaderValue, Response, StatusCode, Uri};
+use warp::{Filter, Rejection};
 
 mod inject;
 
@@ -49,7 +50,7 @@ enum Commands {
         app_id: InstalledAppId,
 
         key: String,
-    }
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -62,7 +63,6 @@ struct RegisterRequest {
 async fn main() -> anyhow::Result<()> {
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "tracing=info,warp=debug".to_owned());
     tracing_subscriber::fmt()
-        // Use the filter we built above to determine which traces to record.
         .with_env_filter(filter)
         // Record an event when each span closes. This can be used to time our
         // routes' durations!
@@ -124,9 +124,15 @@ async fn main() -> anyhow::Result<()> {
                                     )?;
                                 }
 
-                                inject::inject_ekto(out, EKTO_LIB, ekto_lib_hash.clone()).context("Failed to inject ekto")?;
+                                inject::inject_ekto(out, EKTO_LIB, ekto_lib_hash.clone())
+                                    .context("Failed to inject ekto")?;
                             } else {
-                                inject::require_ekto_lib_latest(out, EKTO_LIB, ekto_lib_hash.clone()).context("Failed to update ekto lib")?;
+                                inject::require_ekto_lib_latest(
+                                    out,
+                                    EKTO_LIB,
+                                    ekto_lib_hash.clone(),
+                                )
+                                .context("Failed to update ekto lib")?;
                             }
                         }
                         location => {
@@ -193,9 +199,7 @@ async fn main() -> anyhow::Result<()> {
                 .and(with_shim_args(client, ekto_lib_hash, installed_app_id))
                 .and(warp::header::optional("Origin"))
                 .and_then(
-                    move |shim_args: ShimArgs, origin: Option<HeaderValue>| async move {
-                        println!("Request from origin: {:?}", origin);
-
+                    move |shim_args: ShimArgs, _origin: Option<HeaderValue>| async move {
                         let token_issued = match shim_args
                             .client
                             .lock()
@@ -223,80 +227,45 @@ async fn main() -> anyhow::Result<()> {
 
                         let ekto_lib_hash = shim_args.ekto_lib_hash.clone();
                         let installed_app_id = shim_args.installed_app_id.clone();
-                        Result::<_, warp::Rejection>::Ok(
+                        Result::<_, Rejection>::Ok(
                             Response::builder()
                                 .header("cache-control", "private, no-store, no-cache")
                                 .header("content-type", "application/javascript")
                                 .body(format!(
-                                    r#"
-                                    import {{generateKey, zomeCallSignerFactory}} from './ekto-lib-{ekto_lib_hash}.js';
+                                    r#"import {{injectPasswordForm, removePasswordForm, configureZomeCallSigner}} from './ekto-lib-{ekto_lib_hash}.js';
 
-                  window.__HC_LAUNCHER_ENV__ = {{
-                    APP_INTERFACE_PORT: {app_port},
-                    INSTALLED_APP_ID: "{installed_app_id}",
-                    APP_INTERFACE_TOKEN: {token:?},
-                  }};
+window.__HC_LAUNCHER_ENV__ = {{
+    APP_INTERFACE_PORT: {app_port},
+    INSTALLED_APP_ID: "{installed_app_id}",
+    APP_INTERFACE_TOKEN: {token:?},
+}};
 
-                  const salt = {salt_bytes:?};
+const salt = {salt_bytes:?};
 
-                  const submitPassword = async (e) => {{
-                    e.preventDefault();
-                    e.stopPropagation();
+const submitPassword = async (e) => {{
+    e.preventDefault();
+    e.stopPropagation();
 
-                    try {{
-                        const password = document.getElementById("ekto-password").value;
+    try {{
+        const password = document.getElementById("ekto-password").value;
 
-                        if (!password) {{
-                            console.error("Password is required");
-                            return false;
-                        }}
+        if (!password) {{
+            console.error("Password is required");
+            return false;
+        }}
 
-                        const keyPair = await generateKey(password, Uint8Array.from(salt));
+        await configureZomeCallSigner(password, salt);
 
-                        const signer = await zomeCallSignerFactory(keyPair);
-                        window.__HC_ZOME_CALL_SIGNER__ = {{
-                            signZomeCall: signer,
-                        }};
+        removePasswordForm();
+    }} catch (e) {{
+        console.error("Failed to initialise signing:", e);
+    }}
 
-                        document.getElementById("ekto-auth-container").remove();
-                    }} catch (e) {{
-                        console.error("Failed to get password:", e);
-                    }}
+    return false;
+}};
 
-                    return false;
-                  }};
-
-                  const container = document.createElement("div");
-                  container.setAttribute("style", "height: 100vh; width: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center;");
-                  container.setAttribute("id", "ekto-auth-container");
-                  document.body.insertBefore(container, document.body.firstChild);
-
-                  const form = document.createElement("form");
-                  form.setAttribute("style", "width: 25%;");
-                  form.onsubmit = submitPassword;
-                  container.appendChild(form);
-
-                  const label = document.createElement("label");
-                  label.innerText = "Ekto password:";
-                  label.setAttribute("for", "ekto-password");
-                  form.appendChild(label);
-
-                  const formSection = document.createElement("div");
-                  formSection.setAttribute("style", "display: flex; flex-direction: row;");
-                  form.appendChild(formSection);
-
-                  const input = document.createElement("input");
-                  input.setAttribute("type", "password");
-                  input.setAttribute("id", "ekto-password");
-                  input.setAttribute("style", "height: 3.5em; flex-grow: 3; background-color: aliceblue; margin-right: 5px; padding: 5px; border-radius: 5px;");
-                  formSection.appendChild(input);
-
-                  const button = document.createElement("button");
-                  button.innerText = "Submit";
-                  button.setAttribute("style", "background: azure; padding: 1em; border-radius: 5px;");
-                  button.setAttribute("type", "submit");
-                  formSection.appendChild(button);
-                "#
+injectPasswordForm(submitPassword);
+"#
                                 )),
                         )
                     },
@@ -308,11 +277,16 @@ async fn main() -> anyhow::Result<()> {
                 .and(warp::body::content_length_limit(200))
                 .and(warp::body::json())
                 .map(|register_request: RegisterRequest| {
-                    println!("A new key requires approval: {}", hex::encode(register_request.public_key));
+                    println!(
+                        "A new key requires approval: {}",
+                        hex::encode(register_request.public_key)
+                    );
                     Response::builder().status(StatusCode::OK).body("")
                 });
 
-            let out = warp::get().and(warp::fs::dir("./out/"));
+            let out = warp::get()
+                .and(warp::fs::dir("./out/"))
+                .recover(handle_fs_rejection);
             warp::serve(shim.or(register).or(out))
                 .run(([127, 0, 0, 1], 8484))
                 .await;
@@ -328,22 +302,24 @@ async fn main() -> anyhow::Result<()> {
                 None => anyhow::bail!("Couldn't connect to Holochain admin interface"),
             };
 
-            let app = client.list_apps(None).await.map_err(|e| {
-                anyhow::anyhow!("Failed to list apps: {e:?}")
-            })?.into_iter().find(|app| &app.installed_app_id == app_id).ok_or_else(|| {
-                anyhow::anyhow!("App not found")
-            })?;
+            let app = client
+                .list_apps(None)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to list apps: {e:?}"))?
+                .into_iter()
+                .find(|app| &app.installed_app_id == app_id)
+                .ok_or_else(|| anyhow::anyhow!("App not found"))?;
 
             for cell_info in app.cell_info.values().flatten() {
                 let cell_id = match cell_info {
                     CellInfo::Provisioned(cell) => cell.cell_id.clone(),
                     CellInfo::Cloned(_) => {
                         println!("Clone cells are not supported");
-                        continue
-                    },
+                        continue;
+                    }
                     CellInfo::Stem(_) => {
                         println!("Stem cells are not supported");
-                        continue
+                        continue;
                     }
                 };
 
@@ -351,20 +327,29 @@ async fn main() -> anyhow::Result<()> {
                 cap_secret[..32].clone_from_slice(key_bytes.as_bytes());
                 cap_secret[32..].clone_from_slice(key_bytes.as_bytes());
 
+                // TODO Needs to match what the UI sends as "provenance" in zome calls but really
+                //      Holochain should be correcting missing or wrong location bytes because it's
+                //      an internal detail and the UI shouldn't have to know about it.
+                //      Equally, why is the capability not found if these location bytes don't match?
+                //      It's only the 32-bit agent public key that identifies the agent, and the location
+                //      bytes are meta-data.
                 let mut key_with_location = key_bytes.clone();
                 key_with_location.extend(&[0, 0, 0, 0]);
 
-                client.grant_zome_call_capability(GrantZomeCallCapabilityPayload {
-                    cell_id: cell_id.clone(),
-                    cap_grant: ZomeCallCapGrant {
-                        tag: "zome-call-signing-key".to_string(),
-                        access: CapAccess::Assigned {
-                            secret: cap_secret.into(),
-                            assignees: BTreeSet::from([AgentPubKey::from_raw_36(key_with_location.clone())]),
+                client
+                    .grant_zome_call_capability(GrantZomeCallCapabilityPayload {
+                        cell_id: cell_id.clone(),
+                        cap_grant: ZomeCallCapGrant {
+                            tag: "zome-call-signing-key".to_string(),
+                            access: CapAccess::Assigned {
+                                secret: cap_secret.into(),
+                                assignees: BTreeSet::from([AgentPubKey::from_raw_36(
+                                    key_with_location.clone(),
+                                )]),
+                            },
+                            functions: GrantedFunctions::All,
                         },
-                        functions: GrantedFunctions::All,
-                    },
-                })
+                    })
                     .await
                     .map_err(|e| anyhow::anyhow!("Conductor API error: {:?}", e))?;
 
@@ -447,4 +432,13 @@ async fn find_or_create_holochain_app_interface(
         .attach_app_interface(0, AllowedOrigins::Any, None)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to attach app interface: {e:?}"))
+}
+
+async fn handle_fs_rejection(err: Rejection) -> Result<impl warp::Reply, Rejection> {
+    if err.is_not_found() {
+        tracing::trace!("Couldn't find file, redirecting to /");
+        Ok(Box::new(warp::redirect::permanent(Uri::from_static("/"))))
+    } else {
+        Err(err)
+    }
 }

@@ -6,11 +6,13 @@ use html5ever::{local_name, ns, parse_document, serialize, Attribute, QualName};
 use markup5ever_rcdom::{Handle, Node, NodeData, RcDom, SerializableHandle};
 use std::cell::RefCell;
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use sha3::Digest;
-use sha3::digest::Update;
+use std::path::PathBuf;
 
-pub fn inject_ekto(content_root: PathBuf, ekto_lib: &str, ekto_lib_hash: String) -> anyhow::Result<()> {
+pub fn inject_ekto(
+    content_root: PathBuf,
+    ekto_lib: &str,
+    ekto_lib_hash: String,
+) -> anyhow::Result<()> {
     let index = content_root.join("index.html");
     if !index.exists() {
         anyhow::bail!("No index.html found in content root");
@@ -32,7 +34,11 @@ pub fn inject_ekto(content_root: PathBuf, ekto_lib: &str, ekto_lib_hash: String)
     Ok(())
 }
 
-pub fn require_ekto_lib_latest(content_root: PathBuf, ekto_lib: &str, ekto_lib_hash: String) -> anyhow::Result<String> {
+pub fn require_ekto_lib_latest(
+    content_root: PathBuf,
+    ekto_lib: &str,
+    ekto_lib_hash: String,
+) -> anyhow::Result<String> {
     let ekto_lib_name = format!("ekto-lib-{ekto_lib_hash}.js");
     let buf = content_root.join(ekto_lib_name.clone());
     if !buf.exists() {
@@ -49,13 +55,16 @@ fn inject_ekto_shim_script(doc: &RcDom) -> anyhow::Result<()> {
         if let Some(head) = first_child(&html, "head") {
             let shim_node = AppendNode(Node::new(NodeData::Element {
                 name: QualName::new(None, ns!(html), local_name!("script")),
-                attrs: RefCell::new(vec![Attribute {
-                    name: QualName::new(None, ns!(), local_name!("type")),
-                    value: "module".into(),
-                }, Attribute {
-                    name: QualName::new(None, ns!(), local_name!("src")),
-                    value: "/ekto-shim.js".into(),
-                }]),
+                attrs: RefCell::new(vec![
+                    Attribute {
+                        name: QualName::new(None, ns!(), local_name!("type")),
+                        value: "module".into(),
+                    },
+                    Attribute {
+                        name: QualName::new(None, ns!(), local_name!("src")),
+                        value: "/ekto-shim.js".into(),
+                    },
+                ]),
                 template_contents: RefCell::new(None),
                 mathml_annotation_xml_integration_point: false,
             }));

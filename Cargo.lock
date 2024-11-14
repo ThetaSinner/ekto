@@ -1185,6 +1185,7 @@ dependencies = [
  "serde",
  "sha3",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "warp",
  "zip",
